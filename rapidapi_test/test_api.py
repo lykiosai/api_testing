@@ -9,10 +9,37 @@ import sys
 import sqlite3
 import time
 from datetime import datetime, timezone
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 
 def pretty_print(obj):
     print(json.dumps(obj, indent=2, sort_keys=True))
+
+
+def print_latest_candles_from_payload(payload, n=2):
+    """Find candles in payload and print the latest `n` entries (UTC-normalized)."""
+    candles = find_candles(payload)
+    if not candles:
+        print("No candle list found in payload.")
+        return
+    latest = candles[-n:]
+    print(f"\nSample latest {len(latest)} candles (UTC):")
+    for i, c in enumerate(latest, 1):
+        ts = get_field(c, ["timestamp", "time", "t"]) or None
+        tsec = normalize_epoch(ts)
+        utc = "-"
+        try:
+            if tsec is not None:
+                utc = datetime.fromtimestamp(tsec, timezone.utc).isoformat().replace("+00:00", "Z")
+        except Exception:
+            utc = "-"
+        o = get_field(c, ["open", "o"]) or "-"
+        h = get_field(c, ["high", "h"]) or "-"
+        l = get_field(c, ["low", "l"]) or "-"
+        cl = get_field(c, ["close", "c"]) or "-"
+        v = get_field(c, ["volume", "v"]) or "-"
+        print(f"{i:2}. {utc} | open: {o} | high: {h} | low: {l} | close: {cl} | volume: {v}")
 
 
 def find_candles(obj):
@@ -101,6 +128,124 @@ def store_candles_db(rows, db_path=None):
     return inserted
 
 
+def store_candles_postgres(rows):
+    """
+    Store rows into Postgres. Rows: (symbol, epoch, utc, open, high, low, close, volume)
+    Uses env vars PG_USER/PG_PASSWORD/PG_HOST/PG_PORT/PG_DB.
+    Returns number of attempted inserts (approx).
+    """
+    user = os.getenv("PG_USER")
+    password = os.getenv("PG_PASSWORD")
+    host = os.getenv("PG_HOST", "localhost")
+    port = os.getenv("PG_PORT", "5432")
+    db = os.getenv("PG_DB")
+    if not all([user, password, db]):
+        print("Postgres env vars missing; skipping Postgres store.")
+        return 0
+
+    dsn = f"postgresql://{user}:{password}@{host}:{port}/{db}"
+    engine = create_engine(dsn, pool_pre_ping=True)
+
+    create_sql = """
+    CREATE TABLE IF NOT EXISTS candles (
+        id SERIAL PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        epoch DOUBLE PRECISION NOT NULL,
+        utc TEXT,
+        open DOUBLE PRECISION,
+        high DOUBLE PRECISION,
+        low DOUBLE PRECISION,
+        close DOUBLE PRECISION,
+        volume DOUBLE PRECISION,
+        UNIQUE (symbol, epoch)
+    );
+    """
+
+    insert_sql = """
+    INSERT INTO candles (symbol, epoch, utc, open, high, low, close, volume)
+    VALUES (:symbol, :epoch, :utc, :open, :high, :low, :close, :volume)
+    ON CONFLICT (symbol, epoch) DO NOTHING
+    """
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(create_sql))
+            # Deduplicate by (symbol, epoch) to avoid double-counting
+            unique = {}
+            for r in rows:
+                try:
+                    epoch_val = float(r[1])
+                except Exception:
+                    continue
+                key = (r[0], epoch_val)
+                if key in unique:
+                    continue
+                unique[key] = {
+                    "symbol": r[0],
+                    "epoch": epoch_val,
+                    "utc": r[2],
+                    "open": r[3],
+                    "high": r[4],
+                    "low": r[5],
+                    "close": r[6],
+                    "volume": r[7],
+                }
+
+            params = list(unique.values())
+            if not params:
+                return 0
+
+            # Build a single bulk INSERT with RETURNING id so we know exactly which rows were inserted.
+            value_placeholders = []
+            flat = {}
+            for i, p in enumerate(params):
+                ph = f"(:symbol{i}, :epoch{i}, :utc{i}, :open{i}, :high{i}, :low{i}, :close{i}, :volume{i})"
+                ph = ph.format(i=i)
+                value_placeholders.append(ph)
+                flat[f"symbol{i}"] = p["symbol"]
+                flat[f"epoch{i}"] = p["epoch"]
+                flat[f"utc{i}"] = p["utc"]
+                flat[f"open{i}"] = p["open"]
+                flat[f"high{i}"] = p["high"]
+                flat[f"low{i}"] = p["low"]
+                flat[f"close{i}"] = p["close"]
+                flat[f"volume{i}"] = p["volume"]
+
+            values_sql = ", ".join(value_placeholders)
+            bulk_sql = (
+                "INSERT INTO candles (symbol, epoch, utc, open, high, low, close, volume) VALUES "
+                + values_sql
+                + " ON CONFLICT (symbol, epoch) DO NOTHING RETURNING id"
+            )
+
+            try:
+                result = conn.execute(text(bulk_sql), flat)
+                returned = result.fetchall()
+                inserted_count = len(returned)
+            except Exception as e:
+                # Fallback to previous executemany approach if bulk INSERT fails
+                try:
+                    conn.execute(text(insert_sql), params)
+                    inserted_count = len(params)
+                except Exception:
+                    print("Postgres insert error:", e)
+                    return 0
+
+            # Ensure sequence is at least max(id)
+            try:
+                max_id = conn.execute(text("SELECT COALESCE(MAX(id), 0) FROM candles")).scalar() or 0
+                seq = conn.execute(text("SELECT pg_get_serial_sequence('candles','id')")).scalar()
+                if seq and max_id:
+                    conn.execute(text(f"SELECT setval(:seq, :val, true)"), {"seq": seq, "val": int(max_id)})
+            except Exception:
+                pass
+
+            return inserted_count
+    except SQLAlchemyError as e:
+        print("Postgres write error:", e)
+    return 0
+
+
 def store_candles_json(rows, json_path=None):
     """Append new rows to a JSON file, avoiding duplicates by (symbol, epoch)."""
     if json_path is None:
@@ -174,6 +319,9 @@ def process_and_store(candles, symbol):
     # Store into DB
     inserted = store_candles_db(rows)
     print(f"Inserted (or ignored duplicates) rows count: {inserted}")
+    # Also store into Postgres (if configured)
+    inserted_pg = store_candles_postgres(rows)
+    print(f"Inserted into Postgres (approx): {inserted_pg}")
     # Also store to JSON file for quick testing / verification
     inserted_json = store_candles_json(rows)
     print(f"New JSON rows appended: {inserted_json}")
@@ -245,8 +393,7 @@ def main():
 
                         if r.status_code == 200 and j is not None:
                             print(f"Success — V3 series returned 200 for symbol {sym}")
-                            print("\nFull JSON response:")
-                            pretty_print(j)
+                            print_latest_candles_from_payload(j, n=2)
                             candles = find_candles(j)
                             if candles:
                                 process_and_store(candles, sym)
@@ -281,8 +428,7 @@ def main():
 
                     if resp.status_code == 200 and data is not None:
                         print("Success — received 200 response")
-                        print("\nFull JSON response:")
-                        pretty_print(data)
+                        print_latest_candles_from_payload(data, n=2)
                         candles = find_candles(data)
                         if candles:
                             process_and_store(candles, symbol)
@@ -380,8 +526,8 @@ def main():
         sys.exit(1)
 
     # At this point, data should be the successful JSON payload
-    print("\nFull JSON response:")
-    pretty_print(data)
+    # Print a concise sample instead of full JSON
+    print_latest_candles_from_payload(data, n=2)
 
     # Try to find candles in the response
     candles = find_candles(data)
