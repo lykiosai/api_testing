@@ -392,6 +392,33 @@ def main():
     if ":" not in symbol:
         symbol_variants += [f"CME:{symbol}", f"NASDAQ:{symbol}", f"CME:MNQ", f"CME:NQ"]
 
+    # Prepare a list of fallback endpoint candidates (remove None/duplicates preserving order)
+    candidates = [
+        env_path,
+        "/ohlc",
+        "/v1/ohlc",
+        "/market/ohlc",
+        "/marketdata/ohlc",
+        "/v1/candles",
+        "/candles",
+        "/v1/quotes",
+        "/quotes",
+        "/v1/quote",
+        "/quote",
+        "/instruments/ohlc",
+    ]
+
+    seen = set()
+    paths = []
+    for p in candidates:
+        if not p:
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        paths.append(p)
+
+    params = {"symbol": symbol}
     try:
         while True:
             candles_found = None
@@ -469,34 +496,7 @@ def main():
         print("\nInterrupted by user — exiting.")
         return
 
-    candidates = [
-        env_path,
-        "/ohlc",
-        "/v1/ohlc",
-        "/market/ohlc",
-        "/marketdata/ohlc",
-        "/v1/candles",
-        "/candles",
-        "/v1/quotes",
-        "/quotes",
-        "/v1/quote",
-        "/quote",
-        "/instruments/ohlc",
-    ]
-
-    # Remove None and duplicates while preserving order
-    seen = set()
-    paths = []
-    for p in candidates:
-        if not p:
-            continue
-        if p in seen:
-            continue
-        seen.add(p)
-        paths.append(p)
-
-    params = {"symbol": symbol}
-
+    # After polling loop (or if polling interrupted) we may attempt a single-shot discovery
     resp = None
     data = None
 
