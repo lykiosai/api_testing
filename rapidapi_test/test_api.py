@@ -11,6 +11,9 @@ import time
 from datetime import datetime, timezone
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
+import psycopg2
+import psycopg2.extras
+from psycopg2 import sql
 
 
 def pretty_print(obj):
@@ -130,9 +133,10 @@ def store_candles_db(rows, db_path=None):
 
 def store_candles_postgres(rows):
     """
-    Store rows into Postgres. Rows: (symbol, epoch, utc, open, high, low, close, volume)
+    Store rows into Postgres using psycopg2. Rows: (symbol, epoch, utc, open, high, low, close, volume)
+    Ensures `id` is never included in the INSERT; PostgreSQL generates it from the sequence.
     Uses env vars PG_USER/PG_PASSWORD/PG_HOST/PG_PORT/PG_DB.
-    Returns number of attempted inserts (approx).
+    Returns number of rows inserted (best-effort).
     """
     user = os.getenv("PG_USER")
     password = os.getenv("PG_PASSWORD")
@@ -143,106 +147,119 @@ def store_candles_postgres(rows):
         print("Postgres env vars missing; skipping Postgres store.")
         return 0
 
-    dsn = f"postgresql://{user}:{password}@{host}:{port}/{db}"
-    engine = create_engine(dsn, pool_pre_ping=True)
-
-    create_sql = """
-    CREATE TABLE IF NOT EXISTS candles (
-        id SERIAL PRIMARY KEY,
-        symbol TEXT NOT NULL,
-        epoch DOUBLE PRECISION NOT NULL,
-        utc TEXT,
-        open DOUBLE PRECISION,
-        high DOUBLE PRECISION,
-        low DOUBLE PRECISION,
-        close DOUBLE PRECISION,
-        volume DOUBLE PRECISION,
-        UNIQUE (symbol, epoch)
-    );
-    """
-
-    insert_sql = """
-    INSERT INTO candles (symbol, epoch, utc, open, high, low, close, volume)
-    VALUES (:symbol, :epoch, :utc, :open, :high, :low, :close, :volume)
-    ON CONFLICT (symbol, epoch) DO NOTHING
-    """
-
+    conn = None
     try:
-        with engine.begin() as conn:
-            conn.execute(text(create_sql))
-            # Deduplicate by (symbol, epoch) to avoid double-counting
-            unique = {}
-            for r in rows:
-                try:
-                    epoch_val = float(r[1])
-                except Exception:
-                    continue
-                key = (r[0], epoch_val)
-                if key in unique:
-                    continue
-                unique[key] = {
-                    "symbol": r[0],
-                    "epoch": epoch_val,
-                    "utc": r[2],
-                    "open": r[3],
-                    "high": r[4],
-                    "low": r[5],
-                    "close": r[6],
-                    "volume": r[7],
-                }
+        conn = psycopg2.connect(dbname=db, user=user, password=password, host=host, port=port)
+        with conn:
+            with conn.cursor() as cur:
+                # Create table if not exists (keeps existing data unchanged)
+                create_sql = """
+                CREATE TABLE IF NOT EXISTS candles (
+                    id SERIAL PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    epoch DOUBLE PRECISION NOT NULL,
+                    utc TEXT,
+                    open DOUBLE PRECISION,
+                    high DOUBLE PRECISION,
+                    low DOUBLE PRECISION,
+                    close DOUBLE PRECISION,
+                    volume DOUBLE PRECISION,
+                    UNIQUE (symbol, epoch)
+                );
+                """
+                cur.execute(create_sql)
 
-            params = list(unique.values())
-            if not params:
-                return 0
+                # Deduplicate by (symbol, epoch) in Python before inserting
+                unique = {}
+                for r in rows:
+                    try:
+                        epoch_val = float(r[1])
+                    except Exception:
+                        continue
+                    key = (r[0], epoch_val)
+                    if key in unique:
+                        continue
+                    unique[key] = {
+                        "symbol": r[0],
+                        "epoch": epoch_val,
+                        "utc": r[2],
+                        "open": r[3],
+                        "high": r[4],
+                        "low": r[5],
+                        "close": r[6],
+                        "volume": r[7],
+                    }
 
-            # Build a single bulk INSERT with RETURNING id so we know exactly which rows were inserted.
-            value_placeholders = []
-            flat = {}
-            for i, p in enumerate(params):
-                ph = f"(:symbol{i}, :epoch{i}, :utc{i}, :open{i}, :high{i}, :low{i}, :close{i}, :volume{i})"
-                ph = ph.format(i=i)
-                value_placeholders.append(ph)
-                flat[f"symbol{i}"] = p["symbol"]
-                flat[f"epoch{i}"] = p["epoch"]
-                flat[f"utc{i}"] = p["utc"]
-                flat[f"open{i}"] = p["open"]
-                flat[f"high{i}"] = p["high"]
-                flat[f"low{i}"] = p["low"]
-                flat[f"close{i}"] = p["close"]
-                flat[f"volume{i}"] = p["volume"]
-
-            values_sql = ", ".join(value_placeholders)
-            bulk_sql = (
-                "INSERT INTO candles (symbol, epoch, utc, open, high, low, close, volume) VALUES "
-                + values_sql
-                + " ON CONFLICT (symbol, epoch) DO NOTHING RETURNING id"
-            )
-
-            try:
-                result = conn.execute(text(bulk_sql), flat)
-                returned = result.fetchall()
-                inserted_count = len(returned)
-            except Exception as e:
-                # Fallback to previous executemany approach if bulk INSERT fails
-                try:
-                    conn.execute(text(insert_sql), params)
-                    inserted_count = len(params)
-                except Exception:
-                    print("Postgres insert error:", e)
+                params = list(unique.values())
+                if not params:
                     return 0
 
-            # Ensure sequence is at least max(id)
-            try:
-                max_id = conn.execute(text("SELECT COALESCE(MAX(id), 0) FROM candles")).scalar() or 0
-                seq = conn.execute(text("SELECT pg_get_serial_sequence('candles','id')")).scalar()
-                if seq and max_id:
-                    conn.execute(text(f"SELECT setval(:seq, :val, true)"), {"seq": seq, "val": int(max_id)})
-            except Exception:
-                pass
+                # Prepare data tuples for execute_values (psycopg2)
+                data_tuples = [
+                    (
+                        p["symbol"],
+                        p["epoch"],
+                        p.get("utc"),
+                        p.get("open"),
+                        p.get("high"),
+                        p.get("low"),
+                        p.get("close"),
+                        p.get("volume"),
+                    )
+                    for p in params
+                ]
 
-            return inserted_count
-    except SQLAlchemyError as e:
+                insert_sql = "INSERT INTO candles (symbol, epoch, utc, open, high, low, close, volume) VALUES %s ON CONFLICT (symbol, epoch) DO NOTHING RETURNING id"
+
+                try:
+                    psycopg2.extras.execute_values(cur, insert_sql, data_tuples, template=None, page_size=1000)
+                    try:
+                        returned = cur.fetchall()
+                        inserted_count = len(returned)
+                    except psycopg2.ProgrammingError:
+                        # No RETURNING rows (driver/version mismatch) — best-effort fallback
+                        inserted_count = 0
+                except Exception as e:
+                    # Fallback to single-row inserts if bulk insert fails
+                    inserted_count = 0
+                    for p in params:
+                        try:
+                            cur.execute(
+                                "INSERT INTO candles (symbol, epoch, utc, open, high, low, close, volume) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (symbol, epoch) DO NOTHING",
+                                (
+                                    p["symbol"],
+                                    p["epoch"],
+                                    p.get("utc"),
+                                    p.get("open"),
+                                    p.get("high"),
+                                    p.get("low"),
+                                    p.get("close"),
+                                    p.get("volume"),
+                                ),
+                            )
+                            if cur.rowcount > 0:
+                                inserted_count += cur.rowcount
+                        except Exception:
+                            continue
+
+                # Sync sequence to at least MAX(id)
+                try:
+                    cur.execute("SELECT COALESCE(MAX(id), 0) FROM candles")
+                    max_id = cur.fetchone()[0] or 0
+                    cur.execute("SELECT pg_get_serial_sequence('candles','id')")
+                    seq = cur.fetchone()[0]
+                    if seq is not None:
+                        # setval expects a regclass; cast the result to regclass and set to max_id (so nextval -> max_id+1)
+                        cur.execute(sql.SQL("SELECT setval(%s::regclass, %s, true)"), (seq, int(max_id)))
+                except Exception:
+                    pass
+
+                return inserted_count
+    except Exception as e:
         print("Postgres write error:", e)
+    finally:
+        if conn:
+            conn.close()
     return 0
 
 
